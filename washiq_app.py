@@ -412,8 +412,7 @@ def upload_screen():
              border-radius:16px; padding:28px 24px 12px; margin-top:6px">
             <div style="font-family:'Bebas Neue',sans-serif; font-size:20px; letter-spacing:3px; color:#D0D0C8; margin-bottom:6px">UPLOAD YOUR CSV REPORT</div>
             <div style="font-family:'{MONO}',monospace; font-size:9px; color:#ccc; line-height:2; margin-bottom:14px">
-                Drag & drop or click below · Any POS export works<br>
-                DRB · PDQ · Washify · Sonny's · WashConnect · Custom
+                Drag & drop or click below · Only Flexwash POS export works<br>
             </div>
         </div>
         """, unsafe_allow_html=True)
