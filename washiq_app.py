@@ -3,15 +3,26 @@ WaveIQ — Car Wash Customer Intelligence Platform
 Architected by Gopi Chand
 
 Run:
-    pip install streamlit pandas plotly
+    pip install streamlit pandas plotly reportlab
     streamlit run waveiq_app.py
 """
 
+import io
 import re
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
+
+# ReportLab imports
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+)
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -89,14 +100,14 @@ PLOTLY_LAYOUT = dict(
 )
 
 # ── Helper: card HTML ─────────────────────────────────────────────────────────
-def card(content: str, border_color: str = AMBER, padding: str = "20px 24px") -> str:
+def card(content, border_color=AMBER, padding="20px 24px"):
     return f"""
     <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.06);
          border-top:2px solid {border_color}; border-radius:12px; padding:{padding}; margin-bottom:8px">
         {content}
     </div>"""
 
-def insight_box(text: str, icon: str = "💡") -> str:
+def insight_box(text, icon="💡"):
     return f"""
     <div style="background:rgba(255,200,60,0.06); border:1px solid rgba(255,200,60,0.15);
          border-left:3px solid {AMBER}; border-radius:8px; padding:14px 18px; margin:10px 0">
@@ -105,13 +116,13 @@ def insight_box(text: str, icon: str = "💡") -> str:
               line-height:1.7; margin-left:8px">{text}</span>
     </div>"""
 
-def action_box(text: str) -> str:
+def action_box(text):
     return f"""
     <div style="background:rgba(167,139,250,0.06); border-left:3px solid #A78BFA;
          border-radius:6px; padding:10px 16px; margin:6px 0; font-family:'Outfit',sans-serif;
          font-size:13px; color:#ccc">→ {text}</div>"""
 
-def section_header(label: str, title: str) -> None:
+def section_header(label, title):
     st.markdown(f"""
     <div style="margin:36px 0 20px">
         <div style="font-family:'{MONO}',monospace; font-size:9px; color:#ccc;
@@ -120,23 +131,340 @@ def section_header(label: str, title: str) -> None:
              letter-spacing:2px; color:#E0E0D8">{title}</div>
     </div>""", unsafe_allow_html=True)
 
+# ── PDF Report Generator ──────────────────────────────────────────────────────
+
+def generate_pdf_report(d, churn_days):
+    """Build a styled dark PDF report and return as bytes."""
+
+    profiles      = d["profiles"]
+    wash_df       = d["wash_df"]
+    pkg_perf      = d["pkg_perf"]
+    day_dist      = d["day_dist"]
+    rev_seg       = d["rev_seg"]
+    now           = d["now"]
+    period_days   = d["period_days"]
+    period_months = d["period_months"]
+
+    total      = len(profiles)
+    members    = int(profiles["is_member"].sum())
+    retail     = total - members
+    mem_pct    = members / total * 100 if total else 0
+    avg_ticket = wash_df[wash_df["total_val"] > 0]["total_val"].mean() if len(wash_df) else 0
+    prem_adopt = (wash_df["tier"] == "Tier 3 (Premium)").mean() * 100 if len(wash_df) else 0
+    seg_counts = profiles["segment"].value_counts()
+
+    mem_profiles = profiles[profiles["is_member"]]
+    avg_vpmo     = mem_profiles["visits_per_month"].mean() if len(mem_profiles) else 0
+    total_rev    = rev_seg["total_spend"].sum() if len(rev_seg) else 0
+    mem_rev      = rev_seg[rev_seg["label"] == "Members"]["total_spend"].sum() if "label" in rev_seg.columns else 0
+    mem_rev_share = mem_rev / total_rev * 100 if total_rev else 0
+
+    churn_high = profiles[(profiles["is_member"]) & (profiles["churn_level"] == "High Risk")]
+    churn_med  = profiles[(profiles["is_member"]) & (profiles["churn_level"] == "Medium Risk")]
+    churn_low  = profiles[(profiles["is_member"]) & (profiles["churn_level"] == "Low Risk")]
+    first_time = profiles[profiles["is_first_time"]]
+
+    retail_p         = profiles[~profiles["is_member"]]
+    retail_rep_rate  = len(retail_p[retail_p["total_visits"] > 1]) / len(retail_p) * 100 if len(retail_p) else 0
+    retail_avg_tick  = retail_p["avg_spend"].mean() if len(retail_p) else 0
+    retail_avg_vis   = retail_p["total_visits"].mean() if len(retail_p) else 0
+    retail_clv       = retail_avg_tick * retail_avg_vis
+    mem_annual       = avg_ticket * avg_vpmo * 12 if avg_ticket and avg_vpmo else 0
+
+    wknd_pct   = day_dist[day_dist["Day"].isin(["Saturday", "Sunday"])]["Pct"].sum()
+    hour_dist  = wash_df.groupby("hour").size().reset_index()
+    hour_dist.columns = ["Hour", "Visits"]
+    peak_hour  = int(hour_dist.loc[hour_dist["Visits"].idxmax(), "Hour"]) if len(hour_dist) else 0
+
+    # ── Colors ────────────────────────────────────────────────────────────────
+    C_BG     = colors.HexColor("#0C0D0F")
+    C_PANEL  = colors.HexColor("#161719")
+    C_AMBER  = colors.HexColor("#FFC83C")
+    C_WHITE  = colors.HexColor("#E0E0D8")
+    C_MUTED  = colors.HexColor("#999999")
+    C_DIVIDER= colors.HexColor("#222224")
+    C_PURPLE = colors.HexColor("#A78BFA")
+
+    # ── Paragraph styles ──────────────────────────────────────────────────────
+    def ps(name, **kw):
+        defaults = dict(fontName="Helvetica", fontSize=10, textColor=C_WHITE,
+                        leading=14, spaceBefore=0, spaceAfter=0)
+        defaults.update(kw)
+        return ParagraphStyle(name, **defaults)
+
+    S_TITLE = ps("title", fontName="Helvetica-Bold", fontSize=28, textColor=C_AMBER, leading=32)
+    S_SUB   = ps("sub",   fontSize=9,  textColor=C_MUTED, leading=13)
+    S_H1    = ps("h1",    fontName="Helvetica-Bold", fontSize=13, textColor=C_AMBER,
+                 leading=17, spaceBefore=16, spaceAfter=4)
+    S_H2    = ps("h2",    fontName="Helvetica-Bold", fontSize=11, textColor=C_WHITE,
+                 leading=15, spaceBefore=8, spaceAfter=4)
+    S_BODY  = ps("body",  fontSize=9,  textColor=colors.HexColor("#CCCCCC"), leading=14)
+    S_MONO  = ps("mono",  fontName="Courier", fontSize=8, textColor=C_MUTED, leading=12)
+    S_LABEL = ps("label", fontName="Helvetica-Bold", fontSize=7, textColor=C_MUTED, leading=10)
+    S_KPI_V = ps("kpiv",  fontName="Helvetica-Bold", fontSize=20, textColor=C_AMBER, leading=24)
+    S_KPI_L = ps("kpil",  fontSize=7,  textColor=C_MUTED, leading=10)
+    S_INS   = ps("ins",   fontSize=9,  textColor=colors.HexColor("#DDDDDD"), leading=14)
+    S_FOOT  = ps("foot",  fontSize=7,  textColor=C_MUTED, leading=11, alignment=TA_CENTER)
+    S_DISC  = ps("disc",  fontSize=8,  textColor=C_MUTED, leading=12)
+
+    def dark_bg(canvas, doc):
+        canvas.saveState()
+        canvas.setFillColor(C_BG)
+        canvas.rect(0, 0, letter[0], letter[1], fill=1, stroke=0)
+        canvas.restoreState()
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter,
+                            leftMargin=0.65*inch, rightMargin=0.65*inch,
+                            topMargin=0.65*inch,  bottomMargin=0.65*inch)
+    story = []
+    W = letter[0] - 1.3*inch  # usable width
+
+    def hr():
+        story.append(Spacer(1, 6))
+        story.append(HRFlowable(width="100%", thickness=1, color=C_DIVIDER, spaceAfter=6))
+
+    def section(title):
+        story.append(Paragraph(title, S_H1))
+        story.append(HRFlowable(width="100%", thickness=1.5, color=C_AMBER,
+                                spaceAfter=8, spaceBefore=2))
+
+    def insight_p(text):
+        t = Table([[Paragraph(text, S_INS)]], colWidths=[W],
+                  style=TableStyle([
+                      ("BACKGROUND",    (0,0), (-1,-1), colors.HexColor("#1A1A0E")),
+                      ("LEFTPADDING",   (0,0), (-1,-1), 10),
+                      ("RIGHTPADDING",  (0,0), (-1,-1), 10),
+                      ("TOPPADDING",    (0,0), (-1,-1), 7),
+                      ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+                      ("LINEBEFORE",    (0,0), (0,-1), 3, C_AMBER),
+                  ]))
+        story.append(t)
+        story.append(Spacer(1, 5))
+
+    def kpi_table(items):
+        n = len(items)
+        cw = W / n
+        row_vals = [Paragraph(v, S_KPI_V) for _, v in items]
+        row_lbls = [Paragraph(l, S_KPI_L) for l, _ in items]
+        t = Table([row_vals, row_lbls], colWidths=[cw]*n,
+                  style=TableStyle([
+                      ("BACKGROUND",    (0,0), (-1,-1), C_PANEL),
+                      ("TOPPADDING",    (0,0), (-1,-1), 10),
+                      ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+                      ("LEFTPADDING",   (0,0), (-1,-1), 12),
+                      ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+                      ("LINEABOVE",     (0,0), (-1,0), 2, C_AMBER),
+                      ("LINEBETWEEN",   (0,0), (-1,-1), 0.5, C_DIVIDER),
+                      ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+                  ]))
+        story.append(t)
+        story.append(Spacer(1, 12))
+
+    def data_table(headers, rows, col_widths=None):
+        if not rows:
+            return
+        if col_widths is None:
+            col_widths = [W / len(headers)] * len(headers)
+        h_style = ParagraphStyle("th", fontName="Helvetica-Bold", fontSize=7,
+                                 textColor=C_MUTED, leading=10)
+        d_style = ParagraphStyle("td", fontSize=8, textColor=C_WHITE, leading=11)
+        tdata = [[Paragraph(h, h_style) for h in headers]]
+        for row in rows:
+            tdata.append([Paragraph(str(c), d_style) for c in row])
+        t = Table(tdata, colWidths=col_widths, repeatRows=1,
+                  style=TableStyle([
+                      ("BACKGROUND",    (0,0),  (-1,0), colors.HexColor("#1C1C1E")),
+                      ("TOPPADDING",    (0,0),  (-1,-1), 5),
+                      ("BOTTOMPADDING", (0,0),  (-1,-1), 4),
+                      ("LEFTPADDING",   (0,0),  (-1,-1), 8),
+                      ("RIGHTPADDING",  (0,0),  (-1,-1), 8),
+                      ("LINEBELOW",     (0,0),  (-1,0),  0.5, C_AMBER),
+                      ("ROWBACKGROUNDS",(0,1),  (-1,-1), [C_PANEL, C_BG]),
+                      ("GRID",          (0,0),  (-1,-1), 0.3, C_DIVIDER),
+                  ]))
+        story.append(t)
+        story.append(Spacer(1, 10))
+
+    # ── Cover ─────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.15*inch))
+    story.append(Paragraph("WAVEIQ", S_TITLE))
+    story.append(Paragraph("CAR WASH CUSTOMER INTELLIGENCE REPORT", S_SUB))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        f"Generated {datetime.now().strftime('%B %d, %Y')}  |  "
+        f"Data through {now.strftime('%B %d, %Y')}  |  {int(period_days)}-day analysis",
+        S_MONO))
+    hr()
+
+    # 1. Site Overview
+    section("1  SITE OVERVIEW")
+    kpi_table([
+        ("TOTAL TRANSACTIONS", f"{len(wash_df):,}"),
+        ("UNIQUE CUSTOMERS",   f"{total:,}"),
+        ("MEMBERS",            f"{members:,}"),
+        ("RETAIL CUSTOMERS",   f"{retail:,}"),
+    ])
+    kpi_table([
+        ("AVG TICKET",         f"${avg_ticket:.2f}" if avg_ticket else "-"),
+        ("PREMIUM ADOPTION",   f"{prem_adopt:.0f}%"),
+        ("MEMBERSHIP PENETR.", f"{mem_pct:.0f}%"),
+        ("AVG VISITS/MO",      f"{avg_vpmo:.1f}"),
+    ])
+
+    # 2. Membership Health
+    section("2  MEMBERSHIP HEALTH")
+    kpi_table([
+        ("ACTIVE MEMBERS",    f"{members:,}"),
+        ("MEMBER REV SHARE",  f"{mem_rev_share:.0f}%"),
+        ("AVG VISITS/MO",     f"{avg_vpmo:.1f}"),
+        ("INDUSTRY BENCHMARK","35-45%"),
+    ])
+    benchmark = 36.0
+    delta = mem_pct - benchmark
+    delta_str = f"+{delta:.1f}pp above" if delta >= 0 else f"{abs(delta):.1f}pp below"
+    insight_p(
+        f"Membership penetration is {mem_pct:.0f}% - {delta_str} the {benchmark:.0f}% industry benchmark. "
+        + ("Tracking well within 35-45% range." if 35 <= mem_pct <= 45
+           else "Focus on POS conversion prompts to close the gap." if mem_pct < 35
+           else "Above typical range - strong membership health.")
+    )
+
+    # 3. Customer Segments
+    section("3  CUSTOMER SEGMENTS")
+    seg_rows = []
+    for seg_name, cnt in seg_counts.items():
+        pct = cnt / total * 100
+        seg_rows.append([seg_name, f"{cnt:,}", f"{pct:.1f}%"])
+    data_table(["SEGMENT", "CUSTOMERS", "SHARE"], seg_rows,
+               col_widths=[3.8*inch, 1.2*inch, 1.0*inch])
+
+    # 4. Package Performance
+    section("4  PACKAGE PERFORMANCE")
+    pkg_rows = []
+    for _, row in pkg_perf.iterrows():
+        pkg_rows.append([
+            row["package"], row["tier"],
+            f"{row['transactions']:,}", f"{row['share_pct']:.1f}%",
+            f"${row['revenue']:.0f}"
+        ])
+    data_table(["PACKAGE", "TIER", "TRANSACTIONS", "SHARE", "REVENUE"],
+               pkg_rows, col_widths=[2.0*inch, 1.3*inch, 1.1*inch, 0.8*inch, 0.8*inch])
+    insight_p(
+        f"Premium adoption is {prem_adopt:.0f}%. "
+        + ("Above the 20% benchmark - strong upsell performance." if prem_adopt >= 20
+           else "Below 20% benchmark. Consider menu redesign or POS upsell prompts.")
+    )
+
+    # 5. Time Patterns
+    section("5  TIME PATTERNS")
+    day_rows = [[row["Day"], f"{row['Visits']:,}", f"{row['Pct']:.1f}%"] for _, row in day_dist.iterrows()]
+    data_table(["DAY OF WEEK", "VISITS", "SHARE"], day_rows,
+               col_widths=[2.5*inch, 1.5*inch, 1.5*inch])
+    insight_p(f"Weekend traffic (Sat + Sun) accounts for {wknd_pct:.0f}% of all visits. Peak hour: {peak_hour}:00.")
+
+    # 6. Churn Risk
+    section("6  CHURN RISK")
+    kpi_table([
+        ("LOW RISK",    f"{len(churn_low):,}"),
+        ("MEDIUM RISK", f"{len(churn_med):,}"),
+        ("HIGH RISK",   f"{len(churn_high):,}"),
+    ])
+    insight_p(
+        f"{len(churn_high):,} members have not visited in over {churn_days} days and are at high risk. "
+        "A complimentary upgrade or personal outreach now has the highest recovery rate."
+    )
+    if len(churn_high):
+        churn_rows = []
+        for _, row in churn_high[["plate_clean","days_since","total_visits","avg_spend"]].head(20).iterrows():
+            churn_rows.append([row["plate_clean"], f"{int(row['days_since'])}d",
+                               int(row["total_visits"]), f"${row['avg_spend']:.2f}"])
+        data_table(["LICENSE PLATE", "DAYS INACTIVE", "TOTAL VISITS", "AVG SPEND"],
+                   churn_rows, col_widths=[2.0*inch, 1.4*inch, 1.3*inch, 1.3*inch])
+
+    # 7. Operator Insights & Actions
+    section("7  OPERATOR INSIGHTS & ACTIONS")
+    for txt in [
+        f"Membership penetration is {mem_pct:.0f}% - " +
+            ("within 35-45% range." if 35 <= mem_pct <= 45
+             else "below 35%. Focus on POS conversion." if mem_pct < 35
+             else "above 45% - strong health."),
+        f"Premium adoption is {prem_adopt:.0f}%. " +
+            ("Above 20% benchmark." if prem_adopt >= 20 else "Below 20% - consider menu redesign."),
+        f"{len(churn_high):,} members are at high churn risk. Send a free upgrade offer now.",
+        f"{len(first_time):,} first-time visitors await follow-up. Contact within 48 hours.",
+        f"Retail repeat rate is {retail_rep_rate:.0f}%. " +
+            ("Above 29% industry avg." if retail_rep_rate >= 29 else "Below 29% - consider a loyalty offer."),
+        f"Weekend traffic is {wknd_pct:.0f}%. Ensure peak staffing by Friday close.",
+    ]:
+        insight_p(txt)
+
+    story.append(Paragraph("Recommended Actions", S_H2))
+    action_rows = [[Paragraph(f"->  {a}", S_BODY)] for a in [
+        f"Target {len(churn_high):,} churn-risk members with a free premium upgrade this week.",
+        "Promote premium packages to price-sensitive customers via POS screen or staff prompt.",
+        f"Launch follow-up offer to {len(first_time):,} first-time visitors within 48 hours.",
+        "Run a weekend membership sign-up special to capitalise on Saturday/Sunday traffic.",
+        "Review digital menu board - ensure premium packages are visually prominent.",
+    ]]
+    story.append(Table(action_rows, colWidths=[W],
+                       style=TableStyle([
+                           ("BACKGROUND",    (0,0), (-1,-1), C_PANEL),
+                           ("TOPPADDING",    (0,0), (-1,-1), 6),
+                           ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+                           ("LEFTPADDING",   (0,0), (-1,-1), 10),
+                           ("RIGHTPADDING",  (0,0), (-1,-1), 10),
+                           ("LINEBEFORE",    (0,0), (0,-1), 3, C_PURPLE),
+                           ("LINEBELOW",     (0,0), (-1,-2), 0.3, C_DIVIDER),
+                       ])))
+
+    # 8. CLV
+    section("8  CUSTOMER LIFETIME VALUE")
+    kpi_table([
+        ("RETAIL CLV",    f"${retail_clv:.0f}"),
+        ("MEMBER ANNUAL", f"${mem_annual:.0f}"),
+    ])
+    story.append(Paragraph(
+        "Retail CLV = avg ticket x avg visits over period.   "
+        "Member Annual = avg ticket x avg visits/mo x 12.",
+        S_MONO))
+
+    # Disclaimer & footer
+    story.append(Spacer(1, 0.25*inch))
+    hr()
+    story.append(Paragraph("DISCLAIMER", S_LABEL))
+    story.append(Spacer(1, 4))
+    story.append(Paragraph(
+        "This report is generated by WaveIQ for informational and educational purposes only. "
+        "Data is derived solely from the uploaded CSV and has not been independently verified. "
+        "WaveIQ, its developers, and Gopi Chand are not responsible for any business decisions "
+        "or financial outcomes made based on this report. Consult qualified professionals before "
+        "making significant operational decisions. Use of this tool constitutes acceptance of these terms.",
+        S_DISC))
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        "WAVEIQ  |  Architected by Gopi Chand  |  Car Wash Customer Intelligence  |  v2.1",
+        S_FOOT))
+
+    doc.build(story, onFirstPage=dark_bg, onLaterPages=dark_bg)
+    return buf.getvalue()
+
 # ── Data Processing ───────────────────────────────────────────────────────────
 
-def clean_plate(p: str) -> str:
+def clean_plate(p):
     return re.sub(r"[^A-Z0-9]", "", str(p).upper().strip())
 
-def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh) -> dict:
+def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh):
     df = pd.read_csv(file)
     df.columns = df.columns.str.strip().str.replace('"', '').str.lower()
 
-    # Column mapping flexibility
     col_map = {
-        "time": ["time", "date", "transaction_date", "datetime", "date_time"],
+        "time":         ["time", "date", "transaction_date", "datetime", "date_time"],
         "licensePlate": ["licenseplate", "plate", "license_plate", "lp"],
-        "package": ["package", "wash_package", "package_name", "service"],
-        "total": ["total", "price", "price_paid", "amount", "total_val"],
-        "type": ["type", "wash_type", "transaction_type", "membership_flag"],
-        "location": ["location", "site", "store"],
+        "package":      ["package", "wash_package", "package_name", "service"],
+        "total":        ["total", "price", "price_paid", "amount", "total_val"],
+        "type":         ["type", "wash_type", "transaction_type", "membership_flag"],
+        "location":     ["location", "site", "store"],
     }
     rename = {}
     for canonical, aliases in col_map.items():
@@ -146,7 +474,6 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
                 break
     df = df.rename(columns=rename)
 
-    # Parse
     df["time"] = pd.to_datetime(df["time"], infer_datetime_format=True, errors="coerce")
     df["total_val"] = (
         df.get("total", pd.Series(dtype=str)).astype(str)
@@ -157,7 +484,6 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
     df = df[df["plate_clean"].str.len() > 0]
     df = df[df["time"].notna()]
 
-    # Wash types
     member_types = ["member wash", "member"]
     retail_types = ["single wash", "retail", "single", "cash"]
     df["is_member_tx"] = df["type"].str.lower().str.strip().isin(member_types)
@@ -166,7 +492,6 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
 
     wash_df = df[df["is_member_tx"] | df["is_retail_tx"]].copy()
 
-    # Package tier by price rank
     pkg_avg = wash_df[wash_df["total_val"] > 0].groupby("package")["total_val"].mean().sort_values()
     n = len(pkg_avg)
     tier_map = {}
@@ -174,7 +499,6 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
         if   i < n * 0.34: tier_map[pkg] = "Tier 1 (Basic)"
         elif i < n * 0.67: tier_map[pkg] = "Tier 2 (Mid)"
         else:               tier_map[pkg] = "Tier 3 (Premium)"
-    # Override with keywords if provided
     for pkg in wash_df["package"].dropna().unique():
         if any(k.lower() in str(pkg).lower() for k in premium_kw):
             tier_map[pkg] = "Tier 3 (Premium)"
@@ -182,38 +506,35 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
             tier_map[pkg] = "Tier 1 (Basic)"
     wash_df["tier"] = wash_df["package"].map(tier_map).fillna("Tier 2 (Mid)")
 
-    # Dates
-    now   = wash_df["time"].max()
-    start = wash_df["time"].min()
-    period_days = max((now - start).days, 1)
+    now           = wash_df["time"].max()
+    start         = wash_df["time"].min()
+    period_days   = max((now - start).days, 1)
     period_months = max(period_days / 30, 1)
 
-    # Customer profiles
     grp = wash_df.groupby("plate_clean")
     profiles = pd.DataFrame({
-        "total_visits":    grp.size(),
-        "member_visits":   grp["is_member_tx"].sum(),
-        "retail_visits":   grp["is_retail_tx"].sum(),
-        "last_visit":      grp["time"].max(),
-        "first_visit":     grp["time"].min(),
-        "avg_spend":       grp["total_val"].mean().round(2),
-        "total_spend":     grp["total_val"].sum().round(2),
-        "packages":        grp["package"].apply(lambda x: " | ".join(sorted(set(x.dropna())))),
-        "weekend_visits":  grp["time"].apply(lambda x: x.dt.dayofweek.isin([5, 6]).sum()),
-        "premium_visits":  grp.apply(lambda g: (g["tier"] == "Tier 3 (Premium)").sum()),
-        "basic_visits":    grp.apply(lambda g: (g["tier"] == "Tier 1 (Basic)").sum()),
+        "total_visits":   grp.size(),
+        "member_visits":  grp["is_member_tx"].sum(),
+        "retail_visits":  grp["is_retail_tx"].sum(),
+        "last_visit":     grp["time"].max(),
+        "first_visit":    grp["time"].min(),
+        "avg_spend":      grp["total_val"].mean().round(2),
+        "total_spend":    grp["total_val"].sum().round(2),
+        "packages":       grp["package"].apply(lambda x: " | ".join(sorted(set(x.dropna())))),
+        "weekend_visits": grp["time"].apply(lambda x: x.dt.dayofweek.isin([5, 6]).sum()),
+        "premium_visits": grp.apply(lambda g: (g["tier"] == "Tier 3 (Premium)").sum()),
+        "basic_visits":   grp.apply(lambda g: (g["tier"] == "Tier 1 (Basic)").sum()),
     }).reset_index()
 
     profiles["days_since"]       = (now - profiles["last_visit"]).dt.days.astype(int)
     profiles["is_member"]        = profiles["member_visits"] > 0
     profiles["weekend_ratio"]    = (profiles["weekend_visits"] / profiles["total_visits"]).round(4)
     profiles["premium_ratio"]    = (profiles["premium_visits"] / profiles["total_visits"]).round(4)
-    profiles["basic_ratio"]      = (profiles["basic_visits"] / profiles["total_visits"]).round(4)
+    profiles["basic_ratio"]      = (profiles["basic_visits"]   / profiles["total_visits"]).round(4)
     profiles["visits_per_month"] = (profiles["total_visits"] / period_months).round(2)
     profiles["visits_per_week"]  = (profiles["total_visits"] / (period_days / 7)).round(4)
     profiles["is_first_time"]    = profiles["total_visits"] == 1
 
-    # Segmentation
     def classify(r):
         if r["is_member"] and r["visits_per_month"] >= hf_vpw:
             return "High Frequency Members"
@@ -232,7 +553,6 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
 
     profiles["segment"] = profiles.apply(classify, axis=1)
 
-    # Churn risk tiers
     def churn_level(r):
         if not r["is_member"]: return None
         if r["days_since"] >= churn_days:          return "High Risk"
@@ -240,16 +560,14 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
         else:                                       return "Low Risk"
     profiles["churn_level"] = profiles.apply(churn_level, axis=1)
 
-    # Time patterns
-    wash_df["day_name"]  = wash_df["time"].dt.day_name()
-    wash_df["hour"]      = wash_df["time"].dt.hour
+    wash_df["day_name"] = wash_df["time"].dt.day_name()
+    wash_df["hour"]     = wash_df["time"].dt.hour
 
     day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     day_dist  = wash_df["day_name"].value_counts().reindex(day_order, fill_value=0).reset_index()
     day_dist.columns = ["Day", "Visits"]
     day_dist["Pct"] = (day_dist["Visits"] / day_dist["Visits"].sum() * 100).round(1)
 
-    # Package performance
     pkg_perf = wash_df.groupby("package").agg(
         transactions=("plate_clean", "count"),
         revenue=("total_val", "sum"),
@@ -257,11 +575,9 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
     ).reset_index().sort_values("transactions", ascending=False)
     pkg_perf["share_pct"] = (pkg_perf["transactions"] / pkg_perf["transactions"].sum() * 100).round(1)
 
-    # Revenue by segment
     rev_seg = profiles.groupby("is_member")["total_spend"].sum().reset_index()
     rev_seg["label"] = rev_seg["is_member"].map({True: "Members", False: "Retail"})
 
-    # Member visit freq distribution
     mem_profiles = profiles[profiles["is_member"]].copy()
     mem_profiles["freq_bucket"] = pd.cut(
         mem_profiles["visits_per_month"],
@@ -272,28 +588,24 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
     mem_freq.columns = ["Frequency", "Members"]
 
     return {
-        "wash_df":    wash_df,
-        "profiles":   profiles,
-        "tier_map":   tier_map,
-        "pkg_perf":   pkg_perf,
-        "day_dist":   day_dist,
-        "rev_seg":    rev_seg,
-        "mem_freq":   mem_freq,
-        "now":        now,
-        "period_days": period_days,
-        "period_months": period_months,
+        "wash_df":      wash_df,
+        "profiles":     profiles,
+        "tier_map":     tier_map,
+        "pkg_perf":     pkg_perf,
+        "day_dist":     day_dist,
+        "rev_seg":      rev_seg,
+        "mem_freq":     mem_freq,
+        "now":          now,
+        "period_days":  period_days,
+        "period_months":period_months,
     }
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
 
-def fig_base(fig):
-    fig.update_layout(**PLOTLY_LAYOUT)
-    return fig
-
-def donut(labels, values, colors, center_text=""):
+def donut(labels, values, colors_list, center_text=""):
     fig = go.Figure(go.Pie(
         labels=labels, values=values, hole=0.62,
-        marker=dict(colors=colors, line=dict(color=BG, width=3)),
+        marker=dict(colors=colors_list, line=dict(color=BG, width=3)),
         textinfo="percent", textfont=dict(size=11, color="#0C0D0F"),
         hovertemplate="<b>%{label}</b><br>%{value:,}<br>%{percent}<extra></extra>",
     ))
@@ -302,25 +614,6 @@ def donut(labels, values, colors, center_text=""):
         margin=dict(l=0, r=130, t=10, b=10),
         annotations=[dict(text=center_text, x=0.5, y=0.5, showarrow=False,
             font=dict(size=13, color=AMBER, family="Bebas Neue"))],
-    )
-    return fig
-
-def hbar(df, x_col, y_col, color_col=None, colors=None, title="", height=260):
-    if colors and color_col:
-        color_vals = df[color_col].map(colors) if isinstance(colors, dict) else colors
-    else:
-        color_vals = AMBER
-    fig = go.Figure(go.Bar(
-        x=df[x_col], y=df[y_col], orientation="h",
-        marker=dict(color=color_vals, opacity=0.85, line=dict(width=0)),
-        text=df[x_col].round(1) if df[x_col].dtype in ["float64", "float32"] else df[x_col],
-        textposition="outside", textfont=dict(size=10, color="#ccc"),
-        hovertemplate=f"<b>%{{y}}</b><br>{x_col}: %{{x}}<extra></extra>",
-    ))
-    fig.update_layout(**PLOTLY_LAYOUT, height=height, showlegend=False,
-        xaxis=dict(gridcolor=GRID, zeroline=False, tickfont=dict(color="#bbb")),
-        yaxis=dict(showgrid=False, tickfont=dict(color="#bbb", size=10)),
-        margin=dict(l=0, r=50, t=28, b=10), title=dict(text=title, font=dict(color="#aaa", size=11), x=0),
     )
     return fig
 
@@ -334,7 +627,8 @@ def vbar(df, x_col, y_col, color=AMBER, title="", height=260):
     fig.update_layout(**PLOTLY_LAYOUT, height=height, showlegend=False,
         xaxis=dict(showgrid=False, tickfont=dict(color="#bbb", size=10)),
         yaxis=dict(gridcolor=GRID, zeroline=False, tickfont=dict(color="#bbb")),
-        margin=dict(l=10, r=10, t=28, b=10), title=dict(text=title, font=dict(color="#aaa", size=11)),
+        margin=dict(l=10, r=10, t=28, b=10),
+        title=dict(text=title, font=dict(color="#aaa", size=11)),
     )
     return fig
 
@@ -426,7 +720,6 @@ def upload_screen():
         </div>
         """, unsafe_allow_html=True)
 
-    # Features
     st.markdown(f"""
     <div style="font-family:'{MONO}',monospace; font-size:9px; color:#ddd; letter-spacing:5px; text-align:center; margin:52px 0 24px">
         WHAT YOU GET AFTER UPLOADING
@@ -456,14 +749,14 @@ def upload_screen():
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 
 def dashboard(d, hf_vpw, churn_days):
-    profiles   = d["profiles"]
-    wash_df    = d["wash_df"]
-    pkg_perf   = d["pkg_perf"]
-    day_dist   = d["day_dist"]
-    rev_seg    = d["rev_seg"]
-    mem_freq   = d["mem_freq"]
-    now        = d["now"]
-    period_days= d["period_days"]
+    profiles    = d["profiles"]
+    wash_df     = d["wash_df"]
+    pkg_perf    = d["pkg_perf"]
+    day_dist    = d["day_dist"]
+    rev_seg     = d["rev_seg"]
+    mem_freq    = d["mem_freq"]
+    now         = d["now"]
+    period_days = d["period_days"]
 
     total      = len(profiles)
     members    = profiles["is_member"].sum()
@@ -473,7 +766,6 @@ def dashboard(d, hf_vpw, churn_days):
     mem_pct    = members / total * 100 if total else 0
     seg_counts = profiles["segment"].value_counts()
 
-    # ── Top brand bar
     st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center;
          border-bottom:1px solid rgba(255,200,60,0.1); padding-bottom:16px; margin-bottom:28px">
@@ -495,10 +787,9 @@ def dashboard(d, hf_vpw, churn_days):
 
     tabs = st.tabs(["📊  Overview", "👥  Membership", "🎯  Segments", "📦  Packages", "📅  Time Patterns", "⚠️  Churn Risk", "🤖  Insights"])
 
-    # ─────────────────────────────── TAB 1: OVERVIEW ─────────────────────────
+    # ─── TAB 1: OVERVIEW ─────────────────────────────────────────────────────
     with tabs[0]:
         section_header("Site Performance", "Dashboard Overview")
-
         k1,k2,k3,k4,k5,k6 = st.columns(6)
         k1.metric("Total Transactions", f"{len(wash_df):,}")
         k2.metric("Unique Customers",   f"{total:,}")
@@ -509,26 +800,17 @@ def dashboard(d, hf_vpw, churn_days):
 
         st.markdown("<div style='margin:28px 0'></div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
-
         with c1:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Customer Mix</div>", unsafe_allow_html=True)
-            st.plotly_chart(
-                donut(["Members","Retail"], [members, retail], [AMBER,"#444"],
-                      f"{mem_pct:.0f}%\nMember"),
-                use_container_width=True, config={"displayModeBar": False}
-            )
-
+            st.plotly_chart(donut(["Members","Retail"],[members,retail],[AMBER,"#444"],f"{mem_pct:.0f}%\nMember"),
+                            use_container_width=True, config={"displayModeBar":False})
         with c2:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Segment Distribution</div>", unsafe_allow_html=True)
-            seg_df = seg_counts.reset_index()
-            seg_df.columns = ["Segment","Count"]
-            st.plotly_chart(
-                donut(seg_df["Segment"].tolist(), seg_df["Count"].tolist(),
-                      [SEG_COLORS.get(s,"#888") for s in seg_df["Segment"]], f"{total:,}\ntotal"),
-                use_container_width=True, config={"displayModeBar": False}
-            )
+            seg_df = seg_counts.reset_index(); seg_df.columns = ["Segment","Count"]
+            st.plotly_chart(donut(seg_df["Segment"].tolist(), seg_df["Count"].tolist(),
+                                  [SEG_COLORS.get(s,"#888") for s in seg_df["Segment"]], f"{total:,}\ntotal"),
+                            use_container_width=True, config={"displayModeBar":False})
 
-        # Stacked proportion bar
         st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin:20px 0 10px'>All Segments — Proportional View</div>", unsafe_allow_html=True)
         fig_stack = go.Figure()
         for seg, cnt in seg_counts.items():
@@ -544,7 +826,7 @@ def dashboard(d, hf_vpw, churn_days):
             xaxis=dict(showgrid=False,showticklabels=False,zeroline=False),
             yaxis=dict(showgrid=False,showticklabels=False),
             showlegend=False, margin=dict(l=0,r=0,t=0,b=0))
-        st.plotly_chart(fig_stack, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_stack, use_container_width=True, config={"displayModeBar":False})
 
         leg_cols = st.columns(len(seg_counts))
         for col, (seg, cnt) in zip(leg_cols, seg_counts.items()):
@@ -554,112 +836,82 @@ def dashboard(d, hf_vpw, churn_days):
                 <div style="font-family:'Bebas Neue',sans-serif; font-size:18px; color:{SEG_COLORS.get(seg,'#888')}; letter-spacing:1px">{cnt:,}</div>
             </div>""", unsafe_allow_html=True)
 
-    # ─────────────────────────────── TAB 2: MEMBERSHIP ───────────────────────
+    # ─── TAB 2: MEMBERSHIP ────────────────────────────────────────────────────
     with tabs[1]:
         section_header("Membership Analytics", "Member Health")
-
         mem_profiles = profiles[profiles["is_member"]].copy()
         avg_vpmo     = mem_profiles["visits_per_month"].mean() if len(mem_profiles) else 0
         mem_rev_pct  = rev_seg[rev_seg["label"]=="Members"]["total_spend"].sum() / rev_seg["total_spend"].sum() * 100 if len(rev_seg) else 0
 
         m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Membership Penetration", f"{mem_pct:.0f}%")
-        m2.metric("Active Members",         f"{members:,}")
-        m3.metric("Avg Visits / Member / Mo", f"{avg_vpmo:.1f}")
-        m4.metric("Member Revenue Share",    f"{mem_rev_pct:.0f}%")
+        m1.metric("Membership Penetration",    f"{mem_pct:.0f}%")
+        m2.metric("Active Members",            f"{members:,}")
+        m3.metric("Avg Visits / Member / Mo",  f"{avg_vpmo:.1f}")
+        m4.metric("Member Revenue Share",      f"{mem_rev_pct:.0f}%")
 
         st.markdown("<div style='margin:20px 0'></div>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
-
         with c1:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Member Visit Frequency Distribution</div>", unsafe_allow_html=True)
-            st.plotly_chart(
-                vbar(mem_freq, "Frequency", "Members", color=AMBER, height=280),
-                use_container_width=True, config={"displayModeBar":False}
-            )
+            st.plotly_chart(vbar(mem_freq,"Frequency","Members",color=AMBER,height=280),
+                            use_container_width=True, config={"displayModeBar":False})
             if len(mem_freq):
-                top_bucket = mem_freq.loc[mem_freq["Members"].idxmax(), "Frequency"]
+                top_bucket = mem_freq.loc[mem_freq["Members"].idxmax(),"Frequency"]
                 st.markdown(insight_box(f"Most members visit <b>{top_bucket}</b> on average."), unsafe_allow_html=True)
-
         with c2:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Revenue: Members vs Retail</div>", unsafe_allow_html=True)
-            rev_labels = rev_seg["label"].tolist()
-            rev_vals   = rev_seg["total_spend"].tolist()
-            st.plotly_chart(
-                donut(rev_labels, rev_vals, [AMBER,"#444"], "Revenue\nSplit"),
-                use_container_width=True, config={"displayModeBar":False}
-            )
+            st.plotly_chart(donut(rev_seg["label"].tolist(), rev_seg["total_spend"].tolist(),
+                                  [AMBER,"#444"], "Revenue\nSplit"),
+                            use_container_width=True, config={"displayModeBar":False})
             st.markdown(insight_box("Membership program drives majority of revenue when penetration exceeds 30%."), unsafe_allow_html=True)
 
-        # Benchmark callout
-        benchmark = 36.0
-        delta = mem_pct - benchmark
+        benchmark = 36.0; delta = mem_pct - benchmark
         delta_txt = f"+{delta:.1f}pp above" if delta >= 0 else f"{delta:.1f}pp below"
         color_delta = "#34D399" if delta >= 0 else "#FF5A5A"
         st.markdown(f"""
         <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06);
              border-radius:12px; padding:20px 24px; margin-top:12px; display:flex; align-items:center; gap:28px">
-            <div>
-                <div style="font-family:'{MONO}',monospace; font-size:9px; color:#999; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px">Your Penetration</div>
-                <div style="font-family:'Bebas Neue',sans-serif; font-size:36px; color:{AMBER}; letter-spacing:2px">{mem_pct:.0f}%</div>
-            </div>
+            <div><div style="font-family:'{MONO}',monospace; font-size:9px; color:#999; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px">Your Penetration</div>
+                 <div style="font-family:'Bebas Neue',sans-serif; font-size:36px; color:{AMBER}; letter-spacing:2px">{mem_pct:.0f}%</div></div>
             <div style="width:1px; height:48px; background:rgba(255,255,255,0.06)"></div>
-            <div>
-                <div style="font-family:'{MONO}',monospace; font-size:9px; color:#999; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px">Industry Avg</div>
-                <div style="font-family:'Bebas Neue',sans-serif; font-size:36px; color:#ddd; letter-spacing:2px">{benchmark:.0f}%</div>
-            </div>
+            <div><div style="font-family:'{MONO}',monospace; font-size:9px; color:#999; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px">Industry Avg</div>
+                 <div style="font-family:'Bebas Neue',sans-serif; font-size:36px; color:#ddd; letter-spacing:2px">{benchmark:.0f}%</div></div>
             <div style="width:1px; height:48px; background:rgba(255,255,255,0.06)"></div>
-            <div>
-                <div style="font-family:'{MONO}',monospace; font-size:9px; color:#999; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px">vs Benchmark</div>
-                <div style="font-family:'Bebas Neue',sans-serif; font-size:28px; color:{color_delta}; letter-spacing:1px">{delta_txt}</div>
-            </div>
+            <div><div style="font-family:'{MONO}',monospace; font-size:9px; color:#999; letter-spacing:2px; text-transform:uppercase; margin-bottom:4px">vs Benchmark</div>
+                 <div style="font-family:'Bebas Neue',sans-serif; font-size:28px; color:{color_delta}; letter-spacing:1px">{delta_txt}</div></div>
             <div style="font-family:'Outfit',sans-serif; font-size:12px; color:#ddd; line-height:1.7; font-weight:300; max-width:300px">
                 Industry benchmark for express tunnel operations is <b style="color:#ccc">35–45%</b>.
                 {"You're tracking well." if delta >= 0 else "Focus on converting retail customers at POS."}
             </div>
         </div>""", unsafe_allow_html=True)
 
-    # ─────────────────────────────── TAB 3: SEGMENTS ─────────────────────────
+    # ─── TAB 3: SEGMENTS ─────────────────────────────────────────────────────
     with tabs[2]:
         section_header("Behavioral Segmentation", "Customer Segments")
-
         all_segs = ["High Frequency Members","Churn Risk Members","Premium Buyers",
                     "Weekend Washers","Price Sensitive","First Time Visitors"]
-
         for seg in all_segs:
-            if seg not in seg_counts.index:
-                continue
-            cnt   = seg_counts[seg]
-            color = SEG_COLORS.get(seg, "#888")
-            icon  = SEG_ICONS.get(seg, "●")
-            seg_df = profiles[profiles["segment"] == seg]
-            pct    = cnt / total * 100
-
+            if seg not in seg_counts.index: continue
+            cnt = seg_counts[seg]; color = SEG_COLORS.get(seg,"#888")
+            icon = SEG_ICONS.get(seg,"●"); seg_df = profiles[profiles["segment"]==seg]
+            pct = cnt / total * 100
             with st.expander(f"{icon}  **{seg}**  —  {cnt:,} customers  ({pct:.1f}%)", expanded=False):
                 e1,e2,e3,e4 = st.columns(4)
                 e1.metric("Count",        f"{cnt:,}")
                 e2.metric("Avg Visits",   f"{seg_df['total_visits'].mean():.1f}")
                 e3.metric("Avg Spend",    f"${seg_df['avg_spend'].mean():.2f}")
                 e4.metric("Avg Days Ago", f"{seg_df['days_since'].mean():.0f}d")
-
                 descs = {
-                    "High Frequency Members":
-                        "These customers represent your most loyal base. They've built a habit around your wash. Protect them with recognition, early access to new services, and loyalty perks.",
-                    "Churn Risk Members":
-                        "Members with no recent visit. Without intervention, a significant portion will cancel at next billing. A targeted free upgrade or personal outreach can recover most of them.",
-                    "Premium Buyers":
-                        "Customers who consistently choose your top-tier package. They're already invested in quality — upsell add-ons and membership to deepen that relationship.",
-                    "Weekend Washers":
-                        "Their visit pattern is predictable — Saturday and Sunday. Design weekend-specific bundles, flash deals, and social content timed to their rhythm.",
-                    "Price Sensitive":
-                        "Entry-level package regulars. A limited-time upgrade trial at a discounted rate often converts 20-30% of this group into mid-tier members.",
-                    "First Time Visitors":
-                        "Large opportunity — these plates appeared once. A follow-up offer within 48 hours drives the highest repeat conversion rate of any segment.",
+                    "High Frequency Members": "These customers represent your most loyal base. They've built a habit around your wash. Protect them with recognition, early access to new services, and loyalty perks.",
+                    "Churn Risk Members":     "Members with no recent visit. Without intervention, a significant portion will cancel at next billing. A targeted free upgrade or personal outreach can recover most of them.",
+                    "Premium Buyers":         "Customers who consistently choose your top-tier package. They're already invested in quality — upsell add-ons and membership to deepen that relationship.",
+                    "Weekend Washers":        "Their visit pattern is predictable — Saturday and Sunday. Design weekend-specific bundles, flash deals, and social content timed to their rhythm.",
+                    "Price Sensitive":        "Entry-level package regulars. A limited-time upgrade trial at a discounted rate often converts 20-30% of this group into mid-tier members.",
+                    "First Time Visitors":    "Large opportunity — these plates appeared once. A follow-up offer within 48 hours drives the highest repeat conversion rate of any segment.",
                 }
-                desc_text = descs.get(seg, "")
                 st.markdown(f"""
                 <div style="border-left:3px solid {color}; padding-left:14px; margin:12px 0 8px">
-                    <div style="font-family:'Outfit',sans-serif; font-size:13px; color:#ddd; line-height:1.8; font-weight:300">{desc_text}</div>
+                    <div style="font-family:'Outfit',sans-serif; font-size:13px; color:#ddd; line-height:1.8; font-weight:300">{descs.get(seg,"")}</div>
                 </div>
                 <div style="height:5px; background:rgba(255,255,255,0.06); border-radius:3px; margin:10px 0 4px">
                     <div style="height:5px; width:{pct:.1f}%; background:{color}; border-radius:3px"></div>
@@ -667,11 +919,9 @@ def dashboard(d, hf_vpw, churn_days):
                 <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#ccc; margin-top:4px">{pct:.1f}% of all customers</div>
                 """, unsafe_allow_html=True)
 
-        # Segment comparison bar chart
         st.markdown("<div style='margin:28px 0 8px'></div>", unsafe_allow_html=True)
         section_header("", "Segment Size Comparison")
-        seg_comp = seg_counts.reset_index()
-        seg_comp.columns = ["Segment","Count"]
+        seg_comp = seg_counts.reset_index(); seg_comp.columns = ["Segment","Count"]
         seg_comp = seg_comp.sort_values("Count")
         fig_seg = go.Figure(go.Bar(
             x=seg_comp["Count"], y=seg_comp["Segment"], orientation="h",
@@ -685,74 +935,61 @@ def dashboard(d, hf_vpw, churn_days):
             margin=dict(l=0,r=60,t=10,b=10))
         st.plotly_chart(fig_seg, use_container_width=True, config={"displayModeBar":False})
 
-    # ─────────────────────────────── TAB 4: PACKAGES ─────────────────────────
+    # ─── TAB 4: PACKAGES ─────────────────────────────────────────────────────
     with tabs[3]:
         section_header("Package Performance", "What's Selling")
-
-        p1,p2,p3 = st.columns(3)
         prem_txns  = (wash_df["tier"]=="Tier 3 (Premium)").sum()
         prem_adopt = prem_txns / len(wash_df) * 100 if len(wash_df) else 0
         top_pkg    = pkg_perf.iloc[0]["package"] if len(pkg_perf) else "—"
-        p1.metric("Premium Adoption",  f"{prem_adopt:.0f}%")
-        p2.metric("Top Package",       top_pkg)
-        p3.metric("Packages Available",f"{len(pkg_perf)}")
+        p1,p2,p3 = st.columns(3)
+        p1.metric("Premium Adoption",   f"{prem_adopt:.0f}%")
+        p2.metric("Top Package",        top_pkg)
+        p3.metric("Packages Available", f"{len(pkg_perf)}")
 
+        tier_colors = {"Tier 1 (Basic)":"#60A5FA","Tier 2 (Mid)":AMBER,"Tier 3 (Premium)":"#A78BFA"}
         c1, c2 = st.columns(2)
-
         with c1:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Transactions by Package</div>", unsafe_allow_html=True)
             pkg_sorted = pkg_perf.sort_values("transactions")
-            tier_colors = {"Tier 1 (Basic)":"#60A5FA","Tier 2 (Mid)":AMBER,"Tier 3 (Premium)":"#A78BFA"}
             fig_pkg = go.Figure(go.Bar(
                 x=pkg_sorted["transactions"], y=pkg_sorted["package"], orientation="h",
                 marker=dict(color=[tier_colors.get(t,"#888") for t in pkg_sorted["tier"]], opacity=0.85, line=dict(width=0)),
-                text=pkg_sorted["transactions"], textposition="outside",
-                textfont=dict(size=10,color="#ccc"),
+                text=pkg_sorted["transactions"], textposition="outside", textfont=dict(size=10,color="#ccc"),
                 hovertemplate="<b>%{y}</b><br>%{x:,} transactions<extra></extra>",
             ))
-            fig_pkg.update_layout(**PLOTLY_LAYOUT, height=max(260, len(pkg_perf)*40+40),
-                showlegend=False,
+            fig_pkg.update_layout(**PLOTLY_LAYOUT, height=max(260,len(pkg_perf)*40+40), showlegend=False,
                 xaxis=dict(gridcolor=GRID,zeroline=False,tickfont=dict(color="#bbb")),
                 yaxis=dict(showgrid=False,tickfont=dict(color="#ddd",size=10)),
                 margin=dict(l=0,r=60,t=10,b=10))
             st.plotly_chart(fig_pkg, use_container_width=True, config={"displayModeBar":False})
-
         with c2:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Transactions by Tier</div>", unsafe_allow_html=True)
-            tier_agg = wash_df.groupby("tier").size().reset_index()
-            tier_agg.columns = ["Tier","Transactions"]
-            st.plotly_chart(
-                donut(tier_agg["Tier"].tolist(), tier_agg["Transactions"].tolist(),
-                      [tier_colors.get(t,"#888") for t in tier_agg["Tier"]], "Tiers"),
-                use_container_width=True, config={"displayModeBar":False}
-            )
+            tier_agg = wash_df.groupby("tier").size().reset_index(); tier_agg.columns = ["Tier","Transactions"]
+            st.plotly_chart(donut(tier_agg["Tier"].tolist(), tier_agg["Transactions"].tolist(),
+                                  [tier_colors.get(t,"#888") for t in tier_agg["Tier"]], "Tiers"),
+                            use_container_width=True, config={"displayModeBar":False})
 
-        # Package table
         st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin:20px 0 10px'>Package Summary Table</div>", unsafe_allow_html=True)
         tbl = pkg_perf[["package","tier","transactions","share_pct","revenue"]].copy()
         tbl.columns = ["Package","Tier","Transactions","Share %","Revenue ($)"]
         tbl["Revenue ($)"] = tbl["Revenue ($)"].round(0).astype(int)
         st.dataframe(tbl, use_container_width=True, hide_index=True, height=280)
+        st.markdown(insight_box(
+            f"Premium adoption is <b>{prem_adopt:.0f}%</b>. " +
+            ("Above the 20% threshold — strong. ✅" if prem_adopt >= 20 else "Below 20% — consider POS upsell prompts."),
+            "📦" if prem_adopt >= 20 else "📉"), unsafe_allow_html=True)
 
-        if prem_adopt >= 20:
-            st.markdown(insight_box(f"Premium adoption is <b>{prem_adopt:.0f}%</b> — above the 20% threshold considered strong for express tunnel operations. ✅"), unsafe_allow_html=True)
-        else:
-            st.markdown(insight_box(f"Premium adoption is <b>{prem_adopt:.0f}%</b>. Industry strong performers exceed 20%. Consider POS upsell prompts.", "📉"), unsafe_allow_html=True)
-
-    # ─────────────────────────────── TAB 5: TIME PATTERNS ────────────────────
+    # ─── TAB 5: TIME PATTERNS ────────────────────────────────────────────────
     with tabs[4]:
         section_header("Time Pattern Analysis", "When Customers Show Up")
-
         c1, c2 = st.columns(2)
-
         with c1:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Day of Week Distribution</div>", unsafe_allow_html=True)
-            day_colors = [AMBER if d in ["Saturday","Sunday"] else "#444" for d in day_dist["Day"]]
+            day_col_list = [AMBER if d in ["Saturday","Sunday"] else "#444" for d in day_dist["Day"]]
             fig_day = go.Figure(go.Bar(
                 x=day_dist["Day"], y=day_dist["Pct"],
-                marker=dict(color=day_colors, opacity=0.85, line=dict(width=0)),
-                text=day_dist["Pct"].astype(str)+"%",
-                textposition="outside", textfont=dict(size=10,color="#ccc"),
+                marker=dict(color=day_col_list, opacity=0.85, line=dict(width=0)),
+                text=day_dist["Pct"].astype(str)+"%", textposition="outside", textfont=dict(size=10,color="#ccc"),
                 hovertemplate="<b>%{x}</b><br>%{y}% of visits<extra></extra>",
             ))
             fig_day.update_layout(**PLOTLY_LAYOUT, height=300, showlegend=False,
@@ -760,15 +997,12 @@ def dashboard(d, hf_vpw, churn_days):
                 yaxis=dict(gridcolor=GRID,zeroline=False,tickfont=dict(color="#bbb")),
                 margin=dict(l=10,r=10,t=10,b=10))
             st.plotly_chart(fig_day, use_container_width=True, config={"displayModeBar":False})
-
             wknd_pct = day_dist[day_dist["Day"].isin(["Saturday","Sunday"])]["Pct"].sum()
             st.markdown(insight_box(f"Weekend traffic (Sat + Sun) accounts for <b>{wknd_pct:.0f}%</b> of all visits. Staff and supply accordingly."), unsafe_allow_html=True)
-
         with c2:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px'>Hour of Day Distribution</div>", unsafe_allow_html=True)
-            hour_dist = wash_df.groupby("hour").size().reset_index()
-            hour_dist.columns = ["Hour","Visits"]
-            peak_hour = hour_dist.loc[hour_dist["Visits"].idxmax(), "Hour"] if len(hour_dist) else 0
+            hour_dist = wash_df.groupby("hour").size().reset_index(); hour_dist.columns = ["Hour","Visits"]
+            peak_hour = hour_dist.loc[hour_dist["Visits"].idxmax(),"Hour"] if len(hour_dist) else 0
             hour_colors = [AMBER if h == peak_hour else "#444" for h in hour_dist["Hour"]]
             fig_hr = go.Figure(go.Bar(
                 x=hour_dist["Hour"], y=hour_dist["Visits"],
@@ -783,278 +1017,238 @@ def dashboard(d, hf_vpw, churn_days):
             st.plotly_chart(fig_hr, use_container_width=True, config={"displayModeBar":False})
             st.markdown(insight_box(f"Peak hour is <b>{peak_hour}:00</b>. Ensure full lane staffing and chemical levels during this window."), unsafe_allow_html=True)
 
-        # Retail visit frequency
         st.markdown("<div style='margin:28px 0 8px'></div>", unsafe_allow_html=True)
         section_header("", "Retail Customer Visit Frequency")
         retail_profiles = profiles[~profiles["is_member"]].copy()
         if len(retail_profiles):
-            retail_rep = retail_profiles[retail_profiles["total_visits"] > 1]
+            retail_rep  = retail_profiles[retail_profiles["total_visits"] > 1]
             repeat_rate = len(retail_rep) / len(retail_profiles) * 100
             retail_dist = retail_profiles["total_visits"].clip(upper=5).value_counts().sort_index().reset_index()
             retail_dist.columns = ["Visits","Customers"]
             retail_dist["Visits"] = retail_dist["Visits"].astype(str)
             retail_dist.loc[retail_dist["Visits"]=="5","Visits"] = "5+"
-
             r1, r2 = st.columns(2)
             with r1:
                 st.plotly_chart(vbar(retail_dist,"Visits","Customers",color="#60A5FA",height=260),
-                    use_container_width=True, config={"displayModeBar":False})
+                                use_container_width=True, config={"displayModeBar":False})
             with r2:
                 st.metric("Retail Repeat Rate", f"{repeat_rate:.0f}%")
                 st.markdown(insight_box(f"<b>{repeat_rate:.0f}%</b> of retail customers return more than once. Industry average is ~29%. {'Above average ✅' if repeat_rate>=29 else 'Below average — consider a post-visit follow-up offer.'}"), unsafe_allow_html=True)
 
-    # ─────────────────────────────── TAB 6: CHURN RISK ───────────────────────
+    # ─── TAB 6: CHURN RISK ───────────────────────────────────────────────────
     with tabs[5]:
         section_header("Churn Risk Detection", "Member Retention Alert")
-
         churn_df = profiles[profiles["is_member"]].copy()
-        high  = churn_df[churn_df["churn_level"]=="High Risk"]
-        med   = churn_df[churn_df["churn_level"]=="Medium Risk"]
-        low   = churn_df[churn_df["churn_level"]=="Low Risk"]
-
+        high = churn_df[churn_df["churn_level"]=="High Risk"]
+        med  = churn_df[churn_df["churn_level"]=="Medium Risk"]
+        low  = churn_df[churn_df["churn_level"]=="Low Risk"]
         cr1,cr2,cr3 = st.columns(3)
         cr1.metric("🟢 Low Risk",    f"{len(low):,}",  help="Active members with recent visits")
         cr2.metric("🟡 Medium Risk", f"{len(med):,}",  help="Members approaching inactivity threshold")
         cr3.metric("🔴 High Risk",   f"{len(high):,}", help=f"Members with no visit in {churn_days}+ days")
-
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin:16px 0 8px'>Churn Risk Breakdown</div>", unsafe_allow_html=True)
-            risk_labels = ["Low Risk","Medium Risk","High Risk"]
-            risk_vals   = [len(low), len(med), len(high)]
-            risk_colors = ["#34D399","#FFC83C","#FF5A5A"]
-            st.plotly_chart(
-                donut(risk_labels, risk_vals, risk_colors, "Risk\nLevels"),
-                use_container_width=True, config={"displayModeBar":False}
-            )
-
+            st.plotly_chart(donut(["Low Risk","Medium Risk","High Risk"],[len(low),len(med),len(high)],
+                                  ["#34D399","#FFC83C","#FF5A5A"],"Risk\nLevels"),
+                            use_container_width=True, config={"displayModeBar":False})
         with c2:
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin:16px 0 8px'>Days Since Last Visit — Members</div>", unsafe_allow_html=True)
             days_hist = churn_df["days_since"].clip(upper=60)
-            fig_hist = go.Figure(go.Histogram(
-                x=days_hist, nbinsx=20,
+            fig_hist = go.Figure(go.Histogram(x=days_hist, nbinsx=20,
                 marker=dict(color=AMBER, opacity=0.7, line=dict(width=0)),
-                hovertemplate="<b>%{x} days</b><br>%{y} members<extra></extra>",
-            ))
+                hovertemplate="<b>%{x} days</b><br>%{y} members<extra></extra>"))
             fig_hist.add_vline(x=churn_days, line_color="#FF5A5A", line_dash="dash",
                 annotation_text=f"Churn threshold ({churn_days}d)",
-                annotation_font=dict(color="#FF5A5A", size=10))
+                annotation_font=dict(color="#FF5A5A",size=10))
             fig_hist.update_layout(**PLOTLY_LAYOUT, height=280,
                 xaxis=dict(gridcolor=GRID,zeroline=False,tickfont=dict(color="#bbb"),title=dict(text="Days Inactive",font=dict(color="#ddd",size=10))),
                 yaxis=dict(gridcolor=GRID,zeroline=False,tickfont=dict(color="#bbb")),
                 margin=dict(l=10,r=10,t=10,b=32))
             st.plotly_chart(fig_hist, use_container_width=True, config={"displayModeBar":False})
-
         if len(high):
             st.markdown(insight_box(f"<b>{len(high):,} members</b> have not visited in over {churn_days} days and are at high risk of cancellation. A free upgrade or personal outreach now has the highest recovery rate.", "🚨"), unsafe_allow_html=True)
-
-        # High risk table
-        if len(high):
             st.markdown(f"<div style='font-family:{MONO},monospace; font-size:9px; color:#999; letter-spacing:3px; text-transform:uppercase; margin:20px 0 8px'>High Risk Members</div>", unsafe_allow_html=True)
             show = high[["plate_clean","days_since","total_visits","avg_spend","packages"]].copy()
             show.columns = ["Plate","Days Inactive","Total Visits","Avg Spend ($)","Packages"]
-            show = show.sort_values("Days Inactive", ascending=False)
-            st.dataframe(show, use_container_width=True, hide_index=True, height=320)
+            st.dataframe(show.sort_values("Days Inactive",ascending=False), use_container_width=True, hide_index=True, height=320)
 
-    # ─────────────────────────────── TAB 7: INSIGHTS ─────────────────────────
+    # ─── TAB 7: INSIGHTS ─────────────────────────────────────────────────────
     with tabs[6]:
         section_header("AI Operator Insights", "What Your Data Is Telling You")
 
-        retail_rep_rate = 0
         retail_p = profiles[~profiles["is_member"]]
-        if len(retail_p):
-            retail_rep_rate = len(retail_p[retail_p["total_visits"]>1]) / len(retail_p) * 100
-
+        retail_rep_rate = len(retail_p[retail_p["total_visits"]>1]) / len(retail_p) * 100 if len(retail_p) else 0
         first_time = profiles[profiles["is_first_time"]]
         churn_high = profiles[(profiles["is_member"]) & (profiles["churn_level"]=="High Risk")]
+        prem_txns  = (wash_df["tier"]=="Tier 3 (Premium)").sum()
+        prem_adopt = prem_txns / len(wash_df) * 100 if len(wash_df) else 0
 
         insights = [
-            (
-                f"Your membership penetration is <b>{mem_pct:.0f}%</b>, "
-                + ("which is within the typical 35–45% range for express tunnel operations. ✅" if 35 <= mem_pct <= 45
-                   else "slightly below the typical 35–45% range observed in express tunnel operations. Focus on POS conversion prompts." if mem_pct < 35
-                   else "above the typical range — strong membership health. ✅"),
-                "👥"
-            ),
-            (
-                f"Premium package adoption is <b>{prem_adopt:.0f}%</b>. "
-                + ("This is above the 20% benchmark — strong upsell performance. ✅" if prem_adopt >= 20
-                   else "This is below the 20% benchmark. Consider menu redesign or digital menu board upsell prompts."),
-                "📦"
-            ),
-            (
-                f"<b>{len(churn_high):,} members</b> have not visited in over {churn_days} days and may be at risk of cancellation. "
-                "Consider sending a promotional reminder or complimentary upgrade offer immediately.",
-                "⚠️"
-            ),
-            (
-                f"<b>{len(first_time):,} first-time visitors</b> represent your largest conversion opportunity. "
-                "A post-visit SMS or email offer within 48 hours typically yields a 15–25% return rate.",
-                "👋"
-            ),
-            (
-                f"Retail repeat rate is <b>{retail_rep_rate:.0f}%</b>. "
-                + ("Above industry average of 29%. ✅" if retail_rep_rate >= 29
-                   else "Below the 29% industry average. A loyalty punch card or digital follow-up can close this gap."),
-                "🔄"
-            ),
-            (
-                f"Weekend visits account for <b>{day_dist[day_dist['Day'].isin(['Saturday','Sunday'])]['Pct'].sum():.0f}%</b> of all traffic. "
-                "Ensure peak staffing, chemical inventory, and equipment checks are completed by Friday close.",
-                "📅"
-            ),
+            (f"Your membership penetration is <b>{mem_pct:.0f}%</b>, " +
+             ("which is within the typical 35–45% range for express tunnel operations. ✅" if 35 <= mem_pct <= 45
+              else "slightly below the typical 35–45% range. Focus on POS conversion prompts." if mem_pct < 35
+              else "above the typical range — strong membership health. ✅"), "👥"),
+            (f"Premium package adoption is <b>{prem_adopt:.0f}%</b>. " +
+             ("Above the 20% benchmark — strong upsell performance. ✅" if prem_adopt >= 20
+              else "Below the 20% benchmark. Consider menu redesign or digital menu board prompts."), "📦"),
+            (f"<b>{len(churn_high):,} members</b> have not visited in over {churn_days} days. "
+             "Consider sending a promotional reminder or complimentary upgrade offer immediately.", "⚠️"),
+            (f"<b>{len(first_time):,} first-time visitors</b> represent your largest conversion opportunity. "
+             "A post-visit SMS or email offer within 48 hours typically yields a 15–25% return rate.", "👋"),
+            (f"Retail repeat rate is <b>{retail_rep_rate:.0f}%</b>. " +
+             ("Above industry average of 29%. ✅" if retail_rep_rate >= 29
+              else "Below the 29% industry average. A loyalty punch card or digital follow-up can close this gap."), "🔄"),
+            (f"Weekend visits account for <b>{day_dist[day_dist['Day'].isin(['Saturday','Sunday'])]['Pct'].sum():.0f}%</b> of all traffic. "
+             "Ensure peak staffing, chemical inventory, and equipment checks are completed by Friday close.", "📅"),
         ]
-
         for text, icon in insights:
             st.markdown(insight_box(text, icon), unsafe_allow_html=True)
 
-        # Recommended Actions
         st.markdown("<div style='margin:28px 0 12px'></div>", unsafe_allow_html=True)
-        st.markdown(f"""
-        <div style="font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:2px; color:#E0E0D8; margin-bottom:16px">
-            Recommended Actions
-        </div>""", unsafe_allow_html=True)
-
-        actions = [
+        st.markdown(f"""<div style="font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:2px; color:#E0E0D8; margin-bottom:16px">Recommended Actions</div>""", unsafe_allow_html=True)
+        for a in [
             f"Target {len(churn_high):,} churn-risk members with a free premium upgrade this week.",
             "Promote premium packages to price-sensitive segment via POS screen or staff prompt.",
             f"Launch a follow-up offer to {len(first_time):,} first-time visitors within 48 hours of their visit.",
             "Run a weekend membership sign-up special — your Saturday/Sunday traffic is your best conversion window.",
             "Review digital menu board to ensure premium packages are visually prominent and first-positioned.",
-        ]
-        for a in actions:
+        ]:
             st.markdown(action_box(a), unsafe_allow_html=True)
 
-        # CLV summary
+        # CLV
         st.markdown("<div style='margin:28px 0 12px'></div>", unsafe_allow_html=True)
         st.markdown("""<div style="font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:2px; color:#E0E0D8; margin-bottom:16px">Customer Lifetime Value Estimate</div>""", unsafe_allow_html=True)
-
-        retail_avg_ticket = profiles[~profiles["is_member"]]["avg_spend"].mean() if retail > 0 else 0.0
-        retail_avg_visits = profiles[~profiles["is_member"]]["total_visits"].mean() if retail > 0 else 0.0
-        mem_annual = avg_ticket * avg_vpmo * 12 if (avg_ticket and avg_vpmo) else 0.0
-        retail_clv = retail_avg_ticket * retail_avg_visits
+        mem_profiles_t  = profiles[profiles["is_member"]]
+        avg_vpmo_t      = mem_profiles_t["visits_per_month"].mean() if len(mem_profiles_t) else 0
+        avg_ticket_t    = wash_df[wash_df["total_val"] > 0]["total_val"].mean() if len(wash_df) else 0
+        retail_avg_tick = retail_p["avg_spend"].mean() if len(retail_p) else 0
+        retail_avg_vis  = retail_p["total_visits"].mean() if len(retail_p) else 0
+        mem_annual      = avg_ticket_t * avg_vpmo_t * 12 if (avg_ticket_t and avg_vpmo_t) else 0.0
+        retail_clv      = retail_avg_tick * retail_avg_vis
 
         cl1, cl2 = st.columns(2)
         with cl1:
             st.markdown(f"""
             <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.06);
                  border-top:2px solid {AMBER}; border-radius:12px; padding:20px 24px; margin-bottom:8px">
-                <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#ddd;
-                     letter-spacing:2px; text-transform:uppercase; margin-bottom:10px">Retail Customer</div>
-                <div style="font-family:'Bebas Neue',sans-serif; font-size:42px; color:{AMBER};
-                     letter-spacing:2px; line-height:1">${retail_clv:.0f}</div>
-                <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:#bbb;
-                     margin-top:8px">avg ticket x avg visits</div>
-            </div>
-            """, unsafe_allow_html=True)
+                <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#ddd; letter-spacing:2px; text-transform:uppercase; margin-bottom:10px">Retail Customer</div>
+                <div style="font-family:'Bebas Neue',sans-serif; font-size:42px; color:{AMBER}; letter-spacing:2px; line-height:1">${retail_clv:.0f}</div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:#bbb; margin-top:8px">avg ticket x avg visits</div>
+            </div>""", unsafe_allow_html=True)
         with cl2:
             st.markdown(f"""
             <div style="background:rgba(255,255,255,0.025); border:1px solid rgba(255,255,255,0.06);
                  border-top:2px solid {AMBER}; border-radius:12px; padding:20px 24px; margin-bottom:8px">
-                <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#ddd;
-                     letter-spacing:2px; text-transform:uppercase; margin-bottom:10px">Member (Annual)</div>
-                <div style="font-family:'Bebas Neue',sans-serif; font-size:42px; color:{AMBER};
-                     letter-spacing:2px; line-height:1">${mem_annual:.0f}</div>
-                <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:#bbb;
-                     margin-top:8px">avg ticket x visits/mo x 12</div>
-            </div>
-            """, unsafe_allow_html=True)
+                <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#ddd; letter-spacing:2px; text-transform:uppercase; margin-bottom:10px">Member (Annual)</div>
+                <div style="font-family:'Bebas Neue',sans-serif; font-size:42px; color:{AMBER}; letter-spacing:2px; line-height:1">${mem_annual:.0f}</div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:10px; color:#bbb; margin-top:8px">avg ticket x visits/mo x 12</div>
+            </div>""", unsafe_allow_html=True)
 
-        # ── PDF DOWNLOAD ──────────────────────────────────────────────────────
-        st.markdown("<div style='margin:36px 0 12px'></div>", unsafe_allow_html=True)
-        st.markdown("""<div style="font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:2px; color:#E0E0D8; margin-bottom:12px">Download Report</div>""", unsafe_allow_html=True)
+        # ── DOWNLOAD SECTION ──────────────────────────────────────────────────
+        st.markdown("<div style='margin:40px 0 12px'></div>", unsafe_allow_html=True)
+        st.markdown("""<div style="font-family:'Bebas Neue',sans-serif; font-size:22px; letter-spacing:2px; color:#E0E0D8; margin-bottom:4px">Download Report</div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#999; letter-spacing:2px; margin-bottom:20px">Export your full intelligence report — choose plain text or a styled PDF</div>""", unsafe_allow_html=True)
 
+        # Build TXT
         report_lines = [
             "WAVEIQ — CAR WASH CUSTOMER INTELLIGENCE REPORT",
-            "Architected by Gopi Chand",
-            "=" * 60,
+            "Architected by Gopi Chand", "=" * 60,
             f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}",
             f"Data through: {now.strftime('%B %d, %Y')}",
-            f"Analysis period: {int(period_days)} days",
-            "",
-            "SITE OVERVIEW",
-            "-" * 40,
+            f"Analysis period: {int(period_days)} days", "",
+            "SITE OVERVIEW", "-" * 40,
             f"Total Transactions  : {len(wash_df):,}",
             f"Unique Customers    : {total:,}",
             f"Members             : {members:,}",
             f"Retail Customers    : {retail:,}",
-            f"Avg Ticket Price    : ${avg_ticket:.2f}" if avg_ticket else "Avg Ticket Price    : —",
+            f"Avg Ticket Price    : ${avg_ticket_t:.2f}" if avg_ticket_t else "Avg Ticket Price    : —",
             f"Premium Package Rate: {prem_adopt:.0f}%",
-            f"Membership Penetr.  : {mem_pct:.0f}%",
-            "",
-            "CUSTOMER SEGMENTS",
-            "-" * 40,
+            f"Membership Penetr.  : {mem_pct:.0f}%", "",
+            "CUSTOMER SEGMENTS", "-" * 40,
         ]
         for seg_name, cnt in seg_counts.items():
             report_lines.append(f"  {seg_name:<30} {cnt:>6,} customers  ({cnt/total*100:.1f}%)")
-
-        report_lines += [
-            "",
-            "PACKAGE PERFORMANCE",
-            "-" * 40,
-        ]
+        report_lines += ["", "PACKAGE PERFORMANCE", "-" * 40]
         for _, row in pkg_perf.iterrows():
             report_lines.append(f"  {row['package']:<28} {row['transactions']:>6,} txns  {row['share_pct']:.1f}%  {row['tier']}")
-
         report_lines += [
-            "",
-            "CHURN RISK",
-            "-" * 40,
-            f"  High Risk  (no visit {churn_days}+ days) : {len(profiles[(profiles['is_member']) & (profiles['churn_level']=='High Risk')]):,}",
+            "", "CHURN RISK", "-" * 40,
+            f"  High Risk  (no visit {churn_days}+ days) : {len(churn_high):,}",
             f"  Medium Risk                        : {len(profiles[(profiles['is_member']) & (profiles['churn_level']=='Medium Risk')]):,}",
             f"  Low Risk                           : {len(profiles[(profiles['is_member']) & (profiles['churn_level']=='Low Risk')]):,}",
-            "",
-            "CUSTOMER LIFETIME VALUE",
-            "-" * 40,
+            "", "CUSTOMER LIFETIME VALUE", "-" * 40,
             f"  Retail Customer CLV  : ${retail_clv:.2f}",
             f"  Member Annual Value  : ${mem_annual:.2f}",
-            "",
-            "DAY OF WEEK",
-            "-" * 40,
+            "", "DAY OF WEEK", "-" * 40,
         ]
         for _, row in day_dist.iterrows():
             report_lines.append(f"  {row['Day']:<12} {row['Pct']:.1f}%")
-
         report_lines += [
-            "",
-            "=" * 60,
-            "DISCLAIMER",
-            "-" * 40,
-            "This report is generated by WaveIQ for informational and",
-            "educational purposes only. The data, insights, and metrics",
-            "presented are based solely on the CSV file uploaded by the",
-            "user and are not independently verified.",
-            "",
-            "WaveIQ, its developers, and Gopi Chand are not responsible",
-            "for any business decisions, financial outcomes, or operational",
-            "changes made based on this report. Operators should consult",
-            "qualified professionals before making significant business",
-            "decisions. Use of this tool constitutes acceptance of these terms.",
+            "", "=" * 60, "DISCLAIMER", "-" * 40,
+            "This report is generated by WaveIQ for informational and educational purposes only.",
+            "Data is not independently verified. WaveIQ and Gopi Chand are not responsible",
+            "for any business decisions made based on this report.",
             "=" * 60,
             "WAVEIQ · Architected by Gopi Chand · Car Wash Intelligence",
         ]
-
         report_text = "\n".join(report_lines)
-        st.download_button(
-            label="⬇  Download Full Report (TXT)",
-            data=report_text.encode("utf-8"),
-            file_name=f"waveiq_report_{datetime.now().strftime('%Y%m%d')}.txt",
-            mime="text/plain",
-            use_container_width=False,
-        )
-        st.markdown("""
-        <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#888;
-             margin-top:8px; line-height:1.8">
-            Downloads as a formatted text report. Open in any text editor or word processor.
-        </div>""", unsafe_allow_html=True)
 
-        # ── DISCLAIMER ────────────────────────────────────────────────────────
+        dl1, dl2 = st.columns(2)
+
+        with dl1:
+            st.markdown(f"""
+            <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.07);
+                 border-top:2px solid rgba(255,255,255,0.12); border-radius:10px; padding:16px 18px 12px; margin-bottom:8px">
+                <div style="font-family:'JetBrains Mono',monospace; font-size:8px; color:#888; letter-spacing:3px; text-transform:uppercase; margin-bottom:6px">Plain Text  ·  TXT</div>
+                <div style="font-family:'Outfit',sans-serif; font-size:12px; color:#aaa; line-height:1.6">
+                    Structured text report. Open in any editor or import into Word.
+                </div>
+            </div>""", unsafe_allow_html=True)
+            st.download_button(
+                label="⬇  Download TXT Report",
+                data=report_text.encode("utf-8"),
+                file_name=f"waveiq_report_{datetime.now().strftime('%Y%m%d')}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                key="txt_download_btn",
+            )
+
+        with dl2:
+            st.markdown(f"""
+            <div style="background:rgba(255,200,60,0.04); border:1px solid rgba(255,200,60,0.2);
+                 border-top:2px solid {AMBER}; border-radius:10px; padding:16px 18px 12px; margin-bottom:8px">
+                <div style="font-family:'JetBrains Mono',monospace; font-size:8px; color:{AMBER}; letter-spacing:3px; text-transform:uppercase; margin-bottom:6px">Styled PDF  ·  Dark Theme</div>
+                <div style="font-family:'Outfit',sans-serif; font-size:12px; color:#aaa; line-height:1.6">
+                    Dark-themed PDF with KPI panels, segment tables, churn list, and operator insights.
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            if st.button("⚡  Generate PDF Report", use_container_width=True, key="pdf_gen_btn"):
+                with st.spinner("Building your PDF..."):
+                    try:
+                        pdf_bytes = generate_pdf_report(d, churn_days)
+                        st.session_state["pdf_ready"] = pdf_bytes
+                    except Exception as e:
+                        st.error(f"PDF generation failed: {e}")
+
+            if st.session_state.get("pdf_ready"):
+                st.download_button(
+                    label="⬇  Save PDF Report",
+                    data=st.session_state["pdf_ready"],
+                    file_name=f"waveiq_report_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="pdf_save_btn",
+                )
+                st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#888; margin-top:4px; text-align:center">PDF ready · {len(st.session_state['pdf_ready'])//1024} KB</div>""", unsafe_allow_html=True)
+
+        # ── Disclaimer ────────────────────────────────────────────────────────
         st.markdown("<div style='margin:36px 0 12px'></div>", unsafe_allow_html=True)
         st.markdown(f"""
         <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,200,60,0.12);
              border-left:3px solid {AMBER}; border-radius:8px; padding:18px 22px; margin-top:8px">
-            <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:{AMBER};
-                 letter-spacing:3px; text-transform:uppercase; margin-bottom:10px">Disclaimer</div>
+            <div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:{AMBER}; letter-spacing:3px; text-transform:uppercase; margin-bottom:10px">Disclaimer</div>
             <div style="font-family:'Outfit',sans-serif; font-size:12px; color:#bbb; line-height:1.9; font-weight:300">
                 This report is generated by <strong style="color:#ddd">WaveIQ</strong> for
                 <strong style="color:#ddd">informational and educational purposes only.</strong>
@@ -1069,13 +1263,12 @@ def dashboard(d, hf_vpw, churn_days):
             </div>
         </div>""", unsafe_allow_html=True)
 
-        # Footer
         st.markdown(f"""
         <div style="border-top:1px solid rgba(255,255,255,0.04); margin-top:48px; padding-top:20px;
              display:flex; justify-content:space-between; align-items:center">
             <div style="font-family:'Bebas Neue',sans-serif; font-size:20px; letter-spacing:4px; color:#bbb">WAVEIQ</div>
             <div style="font-family:'JetBrains Mono',monospace; font-size:8px; color:#ddd; letter-spacing:2px">Architected by Gopi Chand · Car Wash Customer Intelligence</div>
-            <div style="font-family:'JetBrains Mono',monospace; font-size:8px; color:#bbb">v2.0</div>
+            <div style="font-family:'JetBrains Mono',monospace; font-size:8px; color:#bbb">v2.1</div>
         </div>""", unsafe_allow_html=True)
 
 
@@ -1084,8 +1277,8 @@ def dashboard(d, hf_vpw, churn_days):
 def main():
     hf_vpw, churn_days, wknd, prem_kw, basic_kw = sidebar()
 
-    if "data" not in st.session_state:
-        st.session_state.data = None
+    if "data"      not in st.session_state: st.session_state.data      = None
+    if "pdf_ready" not in st.session_state: st.session_state.pdf_ready = None
 
     uploaded = upload_screen()
 
@@ -1093,7 +1286,8 @@ def main():
         with st.spinner("🌊  Analyzing your data..."):
             try:
                 d = load_and_process(uploaded, prem_kw, basic_kw, churn_days, hf_vpw, wknd)
-                st.session_state.data = d
+                st.session_state.data      = d
+                st.session_state.pdf_ready = None   # reset on new upload
             except Exception as e:
                 st.error(f"Error processing file: {e}")
                 return
