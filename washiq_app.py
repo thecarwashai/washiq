@@ -14,15 +14,19 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 
-# ReportLab imports
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-)
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+# ReportLab imports — optional; PDF button is disabled if not installed
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    )
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -528,6 +532,7 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
 
     profiles["days_since"]       = (now - profiles["last_visit"]).dt.days.astype(int)
     profiles["is_member"]        = profiles["member_visits"] > 0
+    profiles["billing_failed"]   = False   # not applicable for Flexwash
     profiles["weekend_ratio"]    = (profiles["weekend_visits"] / profiles["total_visits"]).round(4)
     profiles["premium_ratio"]    = (profiles["premium_visits"] / profiles["total_visits"]).round(4)
     profiles["basic_ratio"]      = (profiles["basic_visits"]   / profiles["total_visits"]).round(4)
@@ -599,6 +604,199 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
         "period_days":  period_days,
         "period_months":period_months,
     }
+
+# ── DRB Patheon Parser ───────────────────────────────────────────────────────
+
+def load_and_process_drb(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh):
+    """
+    Parse a DRB Patheon DetailTransaction export.
+
+    Key column mappings:
+      Vehicle License Plate Number  → plate
+      Transaction Time              → time
+      Product Name                  → package / tier
+      Price                         → ticket price
+      Transaction Status            → Reloaded / PlanPurchased = active member
+                                      Abandoned = failed billing (churn signal)
+                                      Discontinued / Terminated = cancelled
+      Line Item Action Type Category → Sale rows only (skip Tender rows)
+    """
+    df = pd.read_csv(file)
+    df.columns = df.columns.str.strip()
+
+    # Normalise time
+    df["time"] = pd.to_datetime(df["Transaction Time"], errors="coerce")
+
+    # Clean plate — prefer the plate column; fall back to RFID if blank
+    def _plate(row):
+        p = str(row.get("Vehicle License Plate Number", "") or "").strip()
+        if p:
+            return re.sub(r"[^A-Z0-9]", "", p.upper())
+        rfid = str(row.get("VehicleRfid", "") or "").strip()
+        # RFID entries look like "90097+780602" — not a real plate; skip
+        return ""
+    df["plate_clean"] = df.apply(_plate, axis=1)
+
+    # Keep only Sale-category rows (not Tender rows) with a valid plate and time
+    df = df[
+        (df["Line Item Action Type Category"] == "Sale") &
+        (df["plate_clean"].str.len() > 0) &
+        (df["time"].notna())
+    ].copy()
+
+    # Member flag: plate had at least one successful billing (Reloaded or PlanPurchased)
+    active_statuses = {"Reloaded", "PlanPurchased", "Purchased"}
+    df["is_member_tx"] = df["Transaction Status"].isin(active_statuses)
+
+    # Retail flag: POS cashier single-wash sale with actual revenue
+    # DRB rarely has retail washes but they show up as Cashier1 / Lane / POS cash-out with Price > 0
+    df["is_retail_tx"] = (
+        (~df["Cash Out Location"].str.lower().str.contains("recurring|portal|pwa", na=True)) &
+        (~df["is_member_tx"]) &
+        (df["Price"].fillna(0) > 0) &
+        (df["Line Item Action Type Name"] == "Add Product")
+    )
+
+    # For the wash_df we want: active member billing rows + retail wash rows
+    # Also include Abandoned rows so we can compute churn correctly —
+    # they represent plates with a plan that is failing to charge.
+    # We mark them as members (they were members) but flag for churn.
+    df["is_abandoned"] = (
+        (df["Transaction Status"] == "Abandoned") &
+        (df["Transaction Type"] == "RechargePlan")
+    )
+
+    wash_df = df[df["is_member_tx"] | df["is_retail_tx"] | df["is_abandoned"]].copy()
+    wash_df = wash_df.rename(columns={"Product Name": "package"})
+    wash_df["total_val"] = pd.to_numeric(wash_df["Price"].astype(str).str.replace(r"[$,]","",regex=True), errors="coerce").fillna(0)
+
+    # Tier assignment using keyword overrides + price-rank fallback
+    pkg_avg = wash_df[wash_df["total_val"] > 0].groupby("package")["total_val"].mean().sort_values()
+    n = len(pkg_avg)
+    tier_map = {}
+    for i, pkg in enumerate(pkg_avg.index):
+        if   i < n * 0.34: tier_map[pkg] = "Tier 1 (Basic)"
+        elif i < n * 0.67: tier_map[pkg] = "Tier 2 (Mid)"
+        else:               tier_map[pkg] = "Tier 3 (Premium)"
+    for pkg in wash_df["package"].dropna().unique():
+        if any(k.lower() in str(pkg).lower() for k in premium_kw):
+            tier_map[pkg] = "Tier 3 (Premium)"
+        elif any(k.lower() in str(pkg).lower() for k in basic_kw):
+            tier_map[pkg] = "Tier 1 (Basic)"
+    wash_df["tier"] = wash_df["package"].map(tier_map).fillna("Tier 2 (Mid)")
+
+    now           = wash_df["time"].max()
+    start         = wash_df["time"].min()
+    period_days   = max((now - start).days, 1)
+    period_months = max(period_days / 30, 1)
+
+    # Build per-plate profiles
+    grp = wash_df.groupby("plate_clean")
+    profiles = pd.DataFrame({
+        "total_visits":   grp.size(),
+        "member_visits":  grp["is_member_tx"].sum(),
+        "retail_visits":  grp["is_retail_tx"].sum(),
+        "last_visit":     grp["time"].max(),
+        "first_visit":    grp["time"].min(),
+        "avg_spend":      grp["total_val"].mean().round(2),
+        "total_spend":    grp["total_val"].sum().round(2),
+        "packages":       grp["package"].apply(lambda x: " | ".join(sorted(set(x.dropna())))),
+        "weekend_visits": grp["time"].apply(lambda x: x.dt.dayofweek.isin([5, 6]).sum()),
+        "premium_visits": grp.apply(lambda g: (g["tier"] == "Tier 3 (Premium)").sum()),
+        "basic_visits":   grp.apply(lambda g: (g["tier"] == "Tier 1 (Basic)").sum()),
+    }).reset_index()
+
+    # A plate is a "member" if it ever had a Reloaded/PlanPurchased billing
+    active_plates = set(
+        wash_df[wash_df["is_member_tx"]]["plate_clean"].unique()
+    )
+    # Abandoned-only plates = billing failed, never successfully recharged in this period
+    abandoned_only = set(
+        wash_df[wash_df["is_abandoned"] & ~wash_df["plate_clean"].isin(active_plates)]["plate_clean"].unique()
+    )
+
+    profiles["is_member"] = profiles["plate_clean"].isin(active_plates) | profiles["plate_clean"].isin(abandoned_only)
+    # Mark abandoned-only as billing-failure churn — override days_since to force High Risk
+    profiles["billing_failed"] = profiles["plate_clean"].isin(abandoned_only)
+
+    profiles["days_since"]       = (now - profiles["last_visit"]).dt.days.astype(int)
+    profiles["weekend_ratio"]    = (profiles["weekend_visits"] / profiles["total_visits"]).round(4)
+    profiles["premium_ratio"]    = (profiles["premium_visits"] / profiles["total_visits"]).round(4)
+    profiles["basic_ratio"]      = (profiles["basic_visits"]   / profiles["total_visits"]).round(4)
+    profiles["visits_per_month"] = (profiles["total_visits"] / period_months).round(2)
+    profiles["visits_per_week"]  = (profiles["total_visits"] / (period_days / 7)).round(4)
+    profiles["is_first_time"]    = profiles["total_visits"] == 1
+
+    def classify(r):
+        # Billing failure = churn risk regardless of recency
+        if r["billing_failed"]:
+            return "Churn Risk Members"
+        elif r["is_member"] and r["visits_per_month"] >= hf_vpw:
+            return "High Frequency Members"
+        elif r["is_member"] and r["days_since"] >= churn_days:
+            return "Churn Risk Members"
+        elif r["premium_ratio"] >= 0.70:
+            return "Premium Buyers"
+        elif r["is_first_time"]:
+            return "First Time Visitors"
+        elif r["basic_ratio"] >= 0.80:
+            return "Price Sensitive"
+        elif r["weekend_ratio"] >= wknd_thresh:
+            return "Weekend Washers"
+        else:
+            return "Price Sensitive"
+
+    profiles["segment"] = profiles.apply(classify, axis=1)
+
+    def churn_level(r):
+        if not r["is_member"]: return None
+        # Billing failure = immediate High Risk
+        if r["billing_failed"]:               return "High Risk"
+        if r["days_since"] >= churn_days:     return "High Risk"
+        elif r["days_since"] >= churn_days * 0.7: return "Medium Risk"
+        else:                                 return "Low Risk"
+    profiles["churn_level"] = profiles.apply(churn_level, axis=1)
+
+    wash_df["day_name"] = wash_df["time"].dt.day_name()
+    wash_df["hour"]     = wash_df["time"].dt.hour
+
+    day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    day_dist  = wash_df["day_name"].value_counts().reindex(day_order, fill_value=0).reset_index()
+    day_dist.columns = ["Day", "Visits"]
+    day_dist["Pct"] = (day_dist["Visits"] / day_dist["Visits"].sum() * 100).round(1)
+
+    pkg_perf = wash_df.groupby("package").agg(
+        transactions=("plate_clean", "count"),
+        revenue=("total_val", "sum"),
+        tier=("tier", "first"),
+    ).reset_index().sort_values("transactions", ascending=False)
+    pkg_perf["share_pct"] = (pkg_perf["transactions"] / pkg_perf["transactions"].sum() * 100).round(1)
+
+    rev_seg = profiles.groupby("is_member")["total_spend"].sum().reset_index()
+    rev_seg["label"] = rev_seg["is_member"].map({True: "Members", False: "Retail"})
+
+    mem_profiles = profiles[profiles["is_member"]].copy()
+    mem_profiles["freq_bucket"] = pd.cut(
+        mem_profiles["visits_per_month"],
+        bins=[0, 1, 2, 3, 999],
+        labels=["1 visit/mo", "2 visits/mo", "3 visits/mo", "4+ visits/mo"],
+    )
+    mem_freq = mem_profiles["freq_bucket"].value_counts().sort_index().reset_index()
+    mem_freq.columns = ["Frequency", "Members"]
+
+    return {
+        "wash_df":       wash_df,
+        "profiles":      profiles,
+        "tier_map":      tier_map,
+        "pkg_perf":      pkg_perf,
+        "day_dist":      day_dist,
+        "rev_seg":       rev_seg,
+        "mem_freq":      mem_freq,
+        "now":           now,
+        "period_days":   period_days,
+        "period_months": period_months,
+    }
+
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
 
@@ -706,10 +904,47 @@ def upload_screen():
              border-radius:16px; padding:28px 24px 12px; margin-top:6px">
             <div style="font-family:'Bebas Neue',sans-serif; font-size:20px; letter-spacing:3px; color:#D0D0C8; margin-bottom:6px">UPLOAD YOUR CSV REPORT</div>
             <div style="font-family:'{MONO}',monospace; font-size:9px; color:#ccc; line-height:2; margin-bottom:14px">
-                Drag & drop or click below · Only specific POS export works<br>
+                Select your POS system, then drag &amp; drop or click below
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+        # ── POS system selector ───────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="font-family:'{MONO}',monospace; font-size:8px; color:#999; letter-spacing:3px;
+             text-transform:uppercase; margin:14px 0 6px">POS System</div>
+        """, unsafe_allow_html=True)
+
+        pos_col1, pos_col2 = st.columns(2)
+        with pos_col1:
+            flexwash_btn = st.button(
+                "⚡  Flex Wash",
+                use_container_width=True,
+                key="btn_flexwash",
+                help="Flexwash / ICS POS export",
+            )
+        with pos_col2:
+            drb_btn = st.button(
+                "🔷  DRB Patheon",
+                use_container_width=True,
+                key="btn_drb",
+                help="DRB Patheon DetailTransaction export",
+            )
+
+        # Persist selection in session state
+        if flexwash_btn:
+            st.session_state["pos_system"] = "flexwash"
+        if drb_btn:
+            st.session_state["pos_system"] = "drb"
+
+        pos_system = st.session_state.get("pos_system", "flexwash")
+        pos_label  = "Flex Wash" if pos_system == "flexwash" else "DRB Patheon"
+        pos_color  = AMBER       if pos_system == "flexwash" else "#60A5FA"
+        st.markdown(f"""
+        <div style="font-family:'{MONO}',monospace; font-size:9px; color:{pos_color};
+             letter-spacing:2px; margin:8px 0 14px">
+            ● Selected: {pos_label}
+        </div>""", unsafe_allow_html=True)
 
         uploaded = st.file_uploader("", type=["csv"], label_visibility="collapsed")
 
@@ -744,11 +979,11 @@ def upload_screen():
                 <div style="font-family:'Outfit',sans-serif; font-size:11px; color:#ddd; line-height:1.7; font-weight:300">{body}</div>
             </div>""", unsafe_allow_html=True)
 
-    return uploaded
+    return uploaded, pos_system
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 
-def dashboard(d, hf_vpw, churn_days):
+def dashboard(d, hf_vpw, churn_days, pos_system="flexwash"):
     profiles    = d["profiles"]
     wash_df     = d["wash_df"]
     pkg_perf    = d["pkg_perf"]
@@ -766,6 +1001,9 @@ def dashboard(d, hf_vpw, churn_days):
     mem_pct    = members / total * 100 if total else 0
     seg_counts = profiles["segment"].value_counts()
 
+    pos_label = "Flex Wash" if pos_system == "flexwash" else "DRB Patheon"
+    pos_color = AMBER       if pos_system == "flexwash" else "#60A5FA"
+
     st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center;
          border-bottom:1px solid rgba(255,200,60,0.1); padding-bottom:16px; margin-bottom:28px">
@@ -777,6 +1015,12 @@ def dashboard(d, hf_vpw, churn_days):
                 <div style="font-family:'{MONO}',monospace; font-size:9px; color:#ccc; letter-spacing:1px">
                     {int(period_days)} days of data · through {now.strftime("%b %d, %Y")}
                 </div>
+            </div>
+            <div style="background:rgba(0,0,0,0.3); border:1px solid {pos_color}40;
+                 border-radius:6px; padding:3px 10px; margin-left:4px">
+                <span style="font-family:'{MONO}',monospace; font-size:8px; color:{pos_color}; letter-spacing:2px; text-transform:uppercase">
+                    ● {pos_label}
+                </span>
             </div>
         </div>
         <div style="text-align:right">
@@ -1224,24 +1468,27 @@ def dashboard(d, hf_vpw, churn_days):
                 </div>
             </div>""", unsafe_allow_html=True)
 
-            if st.button("⚡  Generate PDF Report", use_container_width=True, key="pdf_gen_btn"):
-                with st.spinner("Building your PDF..."):
-                    try:
-                        pdf_bytes = generate_pdf_report(d, churn_days)
-                        st.session_state["pdf_ready"] = pdf_bytes
-                    except Exception as e:
-                        st.error(f"PDF generation failed: {e}")
+            if not REPORTLAB_AVAILABLE:
+                st.warning("PDF generation requires `reportlab`. Add it to your `requirements.txt` and redeploy.")
+            else:
+                if st.button("⚡  Generate PDF Report", use_container_width=True, key="pdf_gen_btn"):
+                    with st.spinner("Building your PDF..."):
+                        try:
+                            pdf_bytes = generate_pdf_report(d, churn_days)
+                            st.session_state["pdf_ready"] = pdf_bytes
+                        except Exception as e:
+                            st.error(f"PDF generation failed: {e}")
 
-            if st.session_state.get("pdf_ready"):
-                st.download_button(
-                    label="⬇  Save PDF Report",
-                    data=st.session_state["pdf_ready"],
-                    file_name=f"waveiq_report_{datetime.now().strftime('%Y%m%d')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                    key="pdf_save_btn",
-                )
-                st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#888; margin-top:4px; text-align:center">PDF ready · {len(st.session_state['pdf_ready'])//1024} KB</div>""", unsafe_allow_html=True)
+                if st.session_state.get("pdf_ready"):
+                    st.download_button(
+                        label="⬇  Save PDF Report",
+                        data=st.session_state["pdf_ready"],
+                        file_name=f"waveiq_report_{datetime.now().strftime('%Y%m%d')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="pdf_save_btn",
+                    )
+                    st.markdown(f"""<div style="font-family:'JetBrains Mono',monospace; font-size:9px; color:#888; margin-top:4px; text-align:center">PDF ready · {len(st.session_state['pdf_ready'])//1024} KB</div>""", unsafe_allow_html=True)
 
         # ── Disclaimer ────────────────────────────────────────────────────────
         st.markdown("<div style='margin:36px 0 12px'></div>", unsafe_allow_html=True)
@@ -1277,24 +1524,30 @@ def dashboard(d, hf_vpw, churn_days):
 def main():
     hf_vpw, churn_days, wknd, prem_kw, basic_kw = sidebar()
 
-    if "data"      not in st.session_state: st.session_state.data      = None
-    if "pdf_ready" not in st.session_state: st.session_state.pdf_ready = None
+    if "data"       not in st.session_state: st.session_state.data       = None
+    if "pdf_ready"  not in st.session_state: st.session_state.pdf_ready  = None
+    if "pos_system" not in st.session_state: st.session_state.pos_system = "flexwash"
 
-    uploaded = upload_screen()
+    uploaded, pos_system = upload_screen()
 
     if uploaded is not None:
         with st.spinner("🌊  Analyzing your data..."):
             try:
-                d = load_and_process(uploaded, prem_kw, basic_kw, churn_days, hf_vpw, wknd)
-                st.session_state.data      = d
-                st.session_state.pdf_ready = None   # reset on new upload
+                if pos_system == "drb":
+                    d = load_and_process_drb(uploaded, prem_kw, basic_kw, churn_days, hf_vpw, wknd)
+                else:
+                    d = load_and_process(uploaded, prem_kw, basic_kw, churn_days, hf_vpw, wknd)
+                st.session_state.data       = d
+                st.session_state.pos_system = pos_system
+                st.session_state.pdf_ready  = None
             except Exception as e:
                 st.error(f"Error processing file: {e}")
                 return
 
     if st.session_state.data is not None:
         st.markdown("<hr style='border-color:rgba(255,200,60,0.08); margin:36px 0'>", unsafe_allow_html=True)
-        dashboard(st.session_state.data, hf_vpw, churn_days)
+        dashboard(st.session_state.data, hf_vpw, churn_days,
+                  pos_system=st.session_state.get("pos_system", "flexwash"))
 
 
 if __name__ == "__main__":
