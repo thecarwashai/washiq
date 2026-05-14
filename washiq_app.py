@@ -478,7 +478,7 @@ def load_and_process(file, premium_kw, basic_kw, churn_days, hf_vpw, wknd_thresh
                 break
     df = df.rename(columns=rename)
 
-    df["time"] = pd.to_datetime(df["time"], infer_datetime_format=True, errors="coerce")
+    df["time"] = pd.to_datetime(df["time"], format="mixed", errors="coerce")
     df["total_val"] = (
         df.get("total", pd.Series(dtype=str)).astype(str)
         .str.replace(r"[$,]", "", regex=True).str.strip()
